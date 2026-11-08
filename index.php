@@ -136,7 +136,32 @@ function postgres_url_to_dsn(string $url): string
         }
     }
 
+    $endpoint = neon_endpoint_id((string) $parts['host']);
+    if ($endpoint !== null) {
+        // Neon's proxy requires SNI to route the connection. libpq builds
+        // without SNI support (e.g. the Vercel PHP runtime) fail with
+        // "Endpoint ID is not specified"; passing the endpoint explicitly
+        // works on every libpq. Harmless for clients that do send SNI.
+        $dsn .= ";options=endpoint=" . $endpoint;
+    }
+
     return $dsn;
+}
+
+/**
+ * Extract the Neon endpoint ID (the first label of the hostname) for hosts
+ * like ep-cool-shadow-a1b2c3d4-pooler.eu-central-1.aws.neon.tech. The label
+ * must match the SNI name exactly (including "-pooler" on pooled hosts),
+ * otherwise Neon's proxy rejects the mismatch. Returns null for non-Neon
+ * hosts.
+ */
+function neon_endpoint_id(string $host): ?string
+{
+    if (preg_match('/\A(ep-[a-z0-9-]+)\.[a-z0-9.-]*neon\.tech\z/i', $host, $match) !== 1) {
+        return null;
+    }
+
+    return strtolower($match[1]);
 }
 
 /* -------------------------------------------------------------------------
