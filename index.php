@@ -126,7 +126,10 @@ function postgres_url_to_dsn(string $url): string
     }
     if (isset($parts['query'])) {
         parse_str($parts['query'], $query);
-        foreach (['sslmode', 'channel_binding', 'connect_timeout', 'application_name'] as $key) {
+        // channel_binding=require is rejected by some libpq builds (notably
+        // the Vercel PHP runtime); sslmode=require still encrypts the
+        // connection, so drop the channel_binding parameter.
+        foreach (['sslmode', 'connect_timeout', 'application_name'] as $key) {
             if (isset($query[$key]) && is_string($query[$key])) {
                 $dsn .= ';' . $key . '=' . $query[$key];
             }
