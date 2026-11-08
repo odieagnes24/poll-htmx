@@ -14,13 +14,34 @@ declare(strict_types=1);
  * ---------------------------------------------------------------------- */
 
 /**
+ * Read a process environment variable across the ways PHP may expose it.
+ * Vercel (and other hosts) can put variables in $_SERVER/$_ENV instead of
+ * making them visible through getenv().
+ */
+function env_value(string $name): ?string
+{
+    $value = getenv($name);
+    if (is_string($value) && trim($value) !== '') {
+        return $value;
+    }
+
+    foreach ([$_SERVER[$name] ?? null, $_ENV[$name] ?? null] as $candidate) {
+        if (is_string($candidate) && trim($candidate) !== '') {
+            return $candidate;
+        }
+    }
+
+    return null;
+}
+
+/**
  * Read DATABASE_URL. An environment variable wins (useful for deployment),
  * otherwise .env.local, otherwise .env.
  */
-function database_dsn(): string
+function database_dsn_or_null(): ?string
 {
-    $fromEnv = getenv('DATABASE_URL');
-    if (is_string($fromEnv) && trim($fromEnv) !== '') {
+    $fromEnv = env_value('DATABASE_URL');
+    if ($fromEnv !== null) {
         return trim($fromEnv);
     }
 
@@ -44,7 +65,25 @@ function database_dsn(): string
         }
     }
 
-    throw new RuntimeException('DATABASE_URL is not configured.');
+    return null;
+}
+
+function database_dsn(): string
+{
+    $dsn = database_dsn_or_null();
+    if ($dsn === null) {
+        throw new RuntimeException('DATABASE_URL is not configured.');
+    }
+
+    return $dsn;
+}
+
+function sanitize_error(string $message): string
+{
+    $message = preg_replace('~password=[^;\s]+~i', 'password=<redacted>', $message) ?? $message;
+    $message = preg_replace('~://[^@\s]+@~', '://<redacted>@', $message) ?? $message;
+
+    return substr($message, 0, 300);
 }
 
 /**
@@ -119,7 +158,7 @@ function is_https(): bool
 
     // Vercel terminates TLS at the edge and always serves the deployment
     // over HTTPS, even when the forwarded header is not visible.
-    if (getenv('VERCEL') !== false) {
+    if (env_value('VERCEL') !== null) {
         return true;
     }
 
@@ -411,6 +450,23 @@ SQL);
         }
 
         return $rows;
+    }
+
+    /** Lightweight connectivity/schema probe for the health endpoint. */
+    public function probe(): array
+    {
+        $version = $this->pdo->query('SHOW server_version')->fetchColumn();
+        $tables = $this->pdo->query(
+            "SELECT table_name FROM information_schema.tables
+              WHERE table_schema = current_schema()
+                AND table_name IN ('polls', 'options', 'votes')
+              ORDER BY table_name"
+        )->fetchAll(PDO::FETCH_COLUMN);
+
+        return [
+            'server_version' => (string) $version,
+            'tables' => $tables,
+        ];
     }
 
     public function hasVoted(string $pollId, string $voter): bool
@@ -1266,13 +1322,52 @@ function handle_vote(PollStore $store, string $slug): void
     redirect(poll_url($poll['slug']));
 }
 
+/**
+ * Diagnostics for deployment troubleshooting. Reports configuration and
+ * connectivity status without ever exposing the DSN or credentials.
+ */
+function handle_health(): void
+{
+    $report = [
+        'php' => PHP_VERSION,
+        'pdo_drivers' => PDO::getAvailableDrivers(),
+        'database_url' => database_dsn_or_null() !== null ? 'set' : 'missing',
+        'vercel' => env_value('VERCEL') !== null ? 'yes' : 'no',
+        'region' => env_value('VERCEL_REGION') ?? null,
+    ];
+
+    if ($report['database_url'] === 'missing') {
+        respond_json(['status' => 'error', 'reason' => 'DATABASE_URL missing', ...$report], 500);
+        return;
+    }
+
+    try {
+        $store = new PollStore(connect_database());
+        $probe = $store->probe();
+        respond_json(['status' => 'ok', ...$report, 'database' => $probe]);
+    } catch (Throwable $error) {
+        error_log('[poll-app] health: ' . $error->getMessage());
+        respond_json([
+            'status' => 'error',
+            ...$report,
+            'database' => sanitize_error($error->getMessage()),
+        ], 500);
+    }
+}
+
 function run(): void
 {
-    $store = new PollStore(connect_database());
-
     $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
     $action = $_GET['action'] ?? '';
     $action = is_string($action) ? $action : '';
+
+    if ($action === 'health') {
+        handle_health();
+        return;
+    }
+
+    $store = new PollStore(connect_database());
+
     $slug = $_GET['p'] ?? '';
     $slug = is_string($slug) ? $slug : '';
 
@@ -1307,6 +1402,7 @@ try {
     run();
 } catch (Throwable $error) {
     error_log('[poll-app] ' . $error->getMessage() . ' in ' . $error->getFile() . ':' . $error->getLine());
+    error_log('[poll-app] sanitized: ' . sanitize_error($error->getMessage()));
     if (!headers_sent()) {
         respond_html(render_page('Poll App', <<<'HTML'
 <main class="page">
